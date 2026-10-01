@@ -1,0 +1,5 @@
+power.db
+reports/
+__pycache__/
+.DS_Store
+raw/
