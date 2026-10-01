@@ -8,8 +8,9 @@ One file, standard library plus pandas and numpy. Run from the terminal:
     python bess.py validate        # run checks, write findings to issues
     python bess.py health          # write reports/health.html
     python bess.py firstlook       # write reports/firstlook.csv and a chart
+    python bess.py export --market DAM --from 2025-04-01 --to 2026-03-31   # CSV
 
-Still to come (Phase 1 task 10): export, refresh routine.
+Not built yet: a refresh routine (add new months with fetch, ingest, validate).
 
 Raw data. `fetch` saves each month's IEX market-snapshot page exactly as
 received (raw/<market>/<market>_YYYY-MM.html) and appends one line per request
@@ -816,6 +817,41 @@ def cmd_firstlook(args):
               f"Rs {d.best_2h_spread.median():,.0f}; max-min gap mean Rs {d.max_min_gap.mean():,.0f}")
 
 
+# ---------------------------------------------------------------- export
+
+EXPORT_COLUMNS = ["market", "delivery_date", "block", "block_start", "session_id",
+                  "purchase_bid_mw", "sell_bid_mw", "mcv_mw", "final_scheduled_volume_mw",
+                  "mcp_rs_mwh", "congestion", "known_at", "file_id"]
+
+
+def cmd_export(args):
+    """Write the latest version of each block to CSV, values exactly as stored."""
+    first = date.fromisoformat(args.start) if args.start else HISTORY_START
+    last = date.fromisoformat(args.end) if args.end else date.today()
+    markets = MARKETS if args.market == "ALL" else (args.market,)
+    out = Path(args.out) if args.out else (
+        REPORTS_DIR / f"export_{args.market}_{first}_{last if args.end else 'latest'}.csv")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with connect() as con:
+        cur = con.execute(
+            f"SELECT {', '.join(EXPORT_COLUMNS)}, ({NO_TRADE_SQL}) AS no_trade FROM blocks_latest"
+            f" WHERE market IN ({', '.join('?' * len(markets))}) AND delivery_date BETWEEN ? AND ?"
+            f" ORDER BY market, delivery_date, block",
+            (*markets, first.isoformat(), last.isoformat()))
+        with out.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([c[0] for c in cur.description])
+            n = 0
+            for row in cur:
+                w.writerow(row)
+                n += 1
+    if n == 0:
+        out.unlink()
+        sys.exit(f"no blocks for {args.market} between {first} and {last}; nothing written")
+    print(f"wrote {out}  {n:,} blocks")
+    print("  no_trade = 1 marks blocks published as all zeros (nothing traded, not a Rs 0 price)")
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_init(args):
@@ -845,6 +881,12 @@ def main(argv=None):
     sub.add_parser("health", help="write reports/health.html").set_defaults(func=cmd_health)
     sub.add_parser("firstlook", help="write reports/firstlook.csv, firstlook_monthly.csv and firstlook.png"
                    ).set_defaults(func=cmd_firstlook)
+    p = sub.add_parser("export", help="write blocks to CSV for your own analysis")
+    p.add_argument("--market", default="ALL", type=str.upper, choices=[*MARKETS, "ALL"])
+    p.add_argument("--from", dest="start", help="YYYY-MM-DD, default 2022-04-01")
+    p.add_argument("--to", dest="end", help="YYYY-MM-DD, default last day loaded")
+    p.add_argument("--out", help="CSV path, default reports/export_<market>_<from>_<to>.csv")
+    p.set_defaults(func=cmd_export)
     args = parser.parse_args(argv)
     args.func(args)
 
