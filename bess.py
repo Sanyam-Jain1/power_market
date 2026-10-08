@@ -9,6 +9,9 @@ One file, standard library plus pandas and numpy. Run from the terminal:
     python bess.py health          # write reports/health.html
     python bess.py firstlook       # write reports/firstlook.csv and a chart
     python bess.py export --market DAM --from 2025-04-01 --to 2026-03-31   # CSV
+    python bess.py selftest        # optimiser, look-ahead and information checks
+    python bess.py baselines       # every baseline in docs/baselines.md -> reports/baselines/
+    python bess.py baseline-report --from 2025-10-01   # same reports for a date window
 
 Not built yet: a refresh routine (add new months with fetch, ingest, validate).
 
@@ -36,6 +39,7 @@ import ssl
 import sys
 import time as clock
 import urllib.request
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
@@ -183,6 +187,39 @@ WHERE NOT EXISTS (
       AND b2.delivery_date = b.delivery_date
       AND b2.block = b.block
       AND (f2.downloaded_at, f2.file_id) > (f.downloaded_at, f.file_id)
+);
+
+-- One backtest run: a strategy with fixed battery and cost settings. Re-running
+-- the same run_id replaces it.
+CREATE TABLE IF NOT EXISTS runs (
+    run_id         TEXT PRIMARY KEY,     -- e.g. DA-B4_c1_w300_solar
+    strategy       TEXT NOT NULL,        -- e.g. DA-B4
+    market         TEXT NOT NULL,        -- DAM, RTM or BOTH
+    settings       TEXT NOT NULL,        -- JSON: battery, costs, scenario
+    first_date     TEXT NOT NULL,
+    last_date      TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    code_version   TEXT NOT NULL         -- git commit, "+dirty" if uncommitted changes
+);
+
+-- One row per run and delivery day. Energy in MWh at the grid connection, money in Rs.
+CREATE TABLE IF NOT EXISTS results (
+    run_id         TEXT NOT NULL REFERENCES runs(run_id),
+    delivery_date  TEXT NOT NULL,
+    bought_mwh     REAL NOT NULL,
+    sold_mwh       REAL NOT NULL,
+    buy_cost_rs    REAL NOT NULL,        -- energy bought x clearing price
+    sell_revenue_rs REAL NOT NULL,       -- energy sold x clearing price
+    fees_rs        REAL NOT NULL,        -- exchange fees, both sides
+    wear_rs        REAL NOT NULL,
+    profit_rs      REAL NOT NULL,        -- revenue - cost - fees - wear
+    opt_gap_rs     REAL NOT NULL,        -- proven bound on optimiser shortfall vs the best plan on the
+                                         -- prices planned on (for ceilings: exact optimum <= profit + gap)
+    cycles         REAL NOT NULL,        -- stored energy discharged / usable energy
+    unfilled_mwh   REAL NOT NULL,        -- planned in no-trade or missing blocks
+    cut_mwh        REAL NOT NULL,        -- cut by the participation limit
+    stranded_mwh   REAL NOT NULL,        -- stored energy left above the floor at day end (valued at 0)
+    PRIMARY KEY (run_id, delivery_date)
 );
 """
 
@@ -852,6 +889,948 @@ def cmd_export(args):
     print("  no_trade = 1 marks blocks published as all zeros (nothing traded, not a Rs 0 price)")
 
 
+# ---------------------------------------------------------------- battery, optimiser, settlement
+#
+# Phase 2 core (spec: docs/baselines.md). Prices are (days x 96) arrays with NaN
+# where nothing can be traded. A plan is an integer array of state-of-charge
+# changes per block, in SoC steps (1% of energy): positive charges, negative
+# discharges. Strategies make plans from the information they may see; settle()
+# then applies the plan to the actual prices.
+
+@dataclass(frozen=True)
+class Battery:
+    power_mw: float = 100.0
+    energy_mwh: float = 200.0
+    rte: float = 0.87               # round trip; split evenly between charging and discharging
+    soc_min: float = 0.10
+    soc_max: float = 0.90           # each day starts at soc_min and must end there
+    soc_step: float = 0.01          # optimiser resolution, as a share of energy
+    fee_rs_mwh: float = 20.0        # exchange fee, each side (2 paise/kWh)
+    wear_rs_mwh: float = 0.0        # per MWh discharged
+    participation: float = 0.10     # max share of a block's cleared volume
+    max_cycles: int = 1             # discharged energy <= max_cycles x usable energy
+    charge_blocks: tuple = None     # (first, last) block in which charging is allowed; None = any
+
+    @property
+    def eta(self):
+        return self.rte ** 0.5
+
+    @property
+    def step_mwh(self):
+        return self.energy_mwh * self.soc_step
+
+    @property
+    def lo(self):
+        return round(self.soc_min / self.soc_step)
+
+    @property
+    def hi(self):
+        return round(self.soc_max / self.soc_step)
+
+    @property
+    def usable_steps(self):
+        return self.hi - self.lo
+
+
+def charge_allowed(bat):
+    import numpy as np
+    mask = np.ones(BLOCKS_PER_DAY, dtype=bool)
+    if bat.charge_blocks:
+        first, last = bat.charge_blocks
+        mask[:] = False
+        mask[first - 1:last] = True
+    return mask
+
+
+def step_limits(bat, mcv):
+    """Max charge and discharge steps per block from power and the participation limit.
+    mcv: (days x 96) cleared volume in MW, NaN = unknown (power limit only)."""
+    import numpy as np
+    grid_mwh = np.minimum(bat.power_mw, bat.participation * np.nan_to_num(mcv, nan=np.inf)) * 0.25
+    ch = np.floor(grid_mwh * bat.eta / bat.step_mwh + 1e-9)
+    dis = np.floor(grid_mwh / bat.eta / bat.step_mwh + 1e-9)
+    return ch.astype(int), dis.astype(int)
+
+
+def grid_mwh(bat, steps):
+    """Energy at the grid connection for SoC changes (charging draws more, discharging delivers less)."""
+    import numpy as np
+    steps = np.asarray(steps, dtype=float)
+    return np.where(steps > 0, steps * bat.step_mwh / bat.eta, -steps * bat.step_mwh * bat.eta)
+
+
+def optimise(bat, buy, sell, ch_lim, dis_lim, lam):
+    """Dynamic programme over state of charge for each day (row) at once.
+    buy/sell: price paths (NaN = that side not tradable); ch_lim/dis_lim: max steps per block;
+    lam: per-day penalty per discharged step (used to enforce the cycle limit).
+    Returns the plan (days x 96) that maximises profit and ends at soc_min."""
+    import numpy as np
+    n, T = buy.shape
+    S, lo = bat.hi + 1, bat.lo
+    NEG = -1e30
+    V = np.full((n, S), NEG)
+    V[:, lo] = 0.0
+    pol = np.zeros((T, n, S), dtype=np.int8)
+    can_charge = charge_allowed(bat)
+    max_ch, max_dis = int(ch_lim.max(initial=0)), int(dis_lim.max(initial=0))
+    for t in range(T - 1, -1, -1):
+        best = V.copy()
+        arg = np.zeros((n, S), dtype=np.int8)
+        bp, sp = buy[:, t], sell[:, t]
+        if can_charge[t]:
+            ok = ~np.isnan(bp)
+            cost = np.where(ok, (bp + bat.fee_rs_mwh) * bat.step_mwh / bat.eta, 0.0)
+            for d in range(1, max_ch + 1):
+                valid = ok & (ch_lim[:, t] >= d)
+                if not valid.any():
+                    break
+                cand = np.full((n, S), NEG)
+                cand[:, lo:S - d] = V[:, lo + d:S] - (d * cost)[:, None]
+                cand[~valid] = NEG
+                better = cand > best
+                best[better] = cand[better]
+                arg[better] = d
+        ok = ~np.isnan(sp)
+        gain = np.where(ok, (sp - bat.fee_rs_mwh - bat.wear_rs_mwh) * bat.step_mwh * bat.eta - lam, 0.0)
+        for d in range(1, max_dis + 1):
+            valid = ok & (dis_lim[:, t] >= d)
+            if not valid.any():
+                break
+            cand = np.full((n, S), NEG)
+            cand[:, lo + d:S] = V[:, lo:S - d] + (d * gain)[:, None]
+            cand[~valid] = NEG
+            better = cand > best
+            best[better] = cand[better]
+            arg[better] = -d
+        V = best
+        pol[t] = arg
+    plan = np.zeros((n, T), dtype=np.int16)
+    s = np.full(n, lo)
+    rows = np.arange(n)
+    for t in range(T):
+        a = pol[t, rows, s]
+        plan[:, t] = a
+        s = s + a
+    return plan
+
+
+def discharged_steps(plan):
+    return -plan.clip(max=0).sum(axis=1)
+
+
+def optimise_exact(bat, buy, sell, ch_lim, dis_lim, limit, chunk=40):
+    """Exact optimum under the cycle limit: the DP state also counts steps discharged so far.
+    Slower and memory-heavy, so plan_days only uses it on days that need it."""
+    import numpy as np
+    n, T = buy.shape
+    S, lo, K = bat.hi + 1, bat.lo, limit + 1
+    NEG = -1e30
+    can_charge = charge_allowed(bat)
+    plans = np.zeros((n, T), dtype=np.int16)
+    for start in range(0, n, chunk):
+        idx = slice(start, min(n, start + chunk))
+        b, s_, cl, dl = buy[idx], sell[idx], ch_lim[idx], dis_lim[idx]
+        m = b.shape[0]
+        V = np.full((m, S, K), NEG)
+        V[:, lo, :] = 0.0
+        pol = np.zeros((T, m, S, K), dtype=np.int8)
+        for t in range(T - 1, -1, -1):
+            best = V.copy()
+            arg = np.zeros((m, S, K), dtype=np.int8)
+            if can_charge[t]:
+                ok = ~np.isnan(b[:, t])
+                cost = np.where(ok, (b[:, t] + bat.fee_rs_mwh) * bat.step_mwh / bat.eta, 0.0)
+                for d in range(1, int(cl[:, t].max(initial=0)) + 1):
+                    rows = np.where(ok & (cl[:, t] >= d))[0]
+                    if not len(rows):
+                        break
+                    cand = V[rows, lo + d:S, :] - (d * cost[rows])[:, None, None]
+                    cur = best[rows, lo:S - d, :]
+                    better = cand > cur
+                    best[rows, lo:S - d, :] = np.where(better, cand, cur)
+                    arg[rows, lo:S - d, :] = np.where(better, d, arg[rows, lo:S - d, :])
+            ok = ~np.isnan(s_[:, t])
+            gain = np.where(ok, (s_[:, t] - bat.fee_rs_mwh - bat.wear_rs_mwh) * bat.step_mwh * bat.eta, 0.0)
+            for d in range(1, min(int(dl[:, t].max(initial=0)), limit) + 1):
+                rows = np.where(ok & (dl[:, t] >= d))[0]
+                if not len(rows):
+                    break
+                cand = V[rows, lo:S - d, d:] + (d * gain[rows])[:, None, None]
+                cur = best[rows, lo + d:S, :K - d]
+                better = cand > cur
+                best[rows, lo + d:S, :K - d] = np.where(better, cand, cur)
+                arg[rows, lo + d:S, :K - d] = np.where(better, -d, arg[rows, lo + d:S, :K - d])
+            V = best
+            pol[t] = arg
+        s, k, rows = np.full(m, lo), np.zeros(m, dtype=int), np.arange(m)
+        for t in range(T):
+            a = pol[t, rows, s, k]
+            plans[idx][:, t] = a
+            s, k = s + a, k + np.where(a < 0, -a, 0)
+    return plans
+
+
+def plan_value(bat, plan, buy, sell):
+    """Profit of a plan on the prices it was planned on (no limits or fills applied)."""
+    import numpy as np
+    ch, dis = plan.clip(min=0), (-plan).clip(min=0)
+    return ((dis * bat.step_mwh * bat.eta * (np.nan_to_num(sell) - bat.fee_rs_mwh - bat.wear_rs_mwh)).sum(1)
+            - (ch * bat.step_mwh / bat.eta * (np.nan_to_num(buy) + bat.fee_rs_mwh)).sum(1))
+
+
+def plan_days(bat, buy, sell, ch_lim, dis_lim, iterations=18, rel_tolerance=0.01):
+    """Plans under the cycle limit for each day (row). Returns (plan, gap): gap is a
+    proven bound on how much more the best possible plan could earn (Rs, on the prices
+    planned on), so optimum <= plan profit + gap.
+    Days whose best plan cycles too much get a penalty per discharged step, found by
+    bisection (smallest penalty that fits). Each penalised solve also gives an upper bound
+    on the best profit (profit - penalty x (used - limit)). Days still more than
+    rel_tolerance below that bound are re-solved exactly (gap 0). Exact solving of every
+    day is too slow; in practice the remaining gap is a fraction of a percent."""
+    import numpy as np
+    n = buy.shape[0]
+    limit = bat.max_cycles * bat.usable_steps
+    plan = optimise(bat, buy, sell, ch_lim, dis_lim, np.zeros(n))
+    gap = np.zeros(n)
+    over = np.where(discharged_steps(plan) > limit)[0]
+    if len(over):
+        sub = lambda a: a[over]
+        b, s, cl, dl = sub(buy), sub(sell), sub(ch_lim), sub(dis_lim)
+        lo_l, hi_l = np.zeros(len(over)), np.full(len(over), 1e5)
+        bound = plan_value(bat, plan[over], b, s)       # the unconstrained optimum is an upper bound
+        best = np.zeros((len(over), plan.shape[1]), dtype=plan.dtype)  # idle always fits
+        for _ in range(iterations):
+            mid = (lo_l + hi_l) / 2
+            p = optimise(bat, b, s, cl, dl, mid)
+            used = discharged_steps(p)
+            bound = np.minimum(bound, plan_value(bat, p, b, s) - mid * (used - limit))
+            fits = used <= limit
+            best[fits] = p[fits]
+            hi_l = np.where(fits, mid, hi_l)
+            lo_l = np.where(fits, lo_l, mid)
+        g = np.maximum(bound - plan_value(bat, best, b, s), 0.0)
+        redo = g > np.maximum(1.0, rel_tolerance * np.abs(bound))
+        if redo.any():
+            best[redo] = optimise_exact(bat, b[redo], s[redo], cl[redo], dl[redo], limit)
+            g[redo] = 0.0
+        plan[over] = best
+        gap[over] = g
+    return plan, gap
+
+
+SETTLE_FIELDS = ["bought_mwh", "sold_mwh", "buy_cost_rs", "sell_revenue_rs", "fees_rs", "wear_rs",
+                 "profit_rs", "opt_gap_rs", "cycles", "unfilled_mwh", "cut_mwh", "stranded_mwh"]
+
+
+def settle(bat, plan, buy, sell, buy_mcv, sell_mcv):
+    """Apply plans to actual prices. Orders in no-trade blocks don't fill; the participation
+    limit cuts volume; anything then impossible (selling energy never bought) is clipped
+    by the SoC band. Energy left at day end is valued at 0. Returns a dict of per-day arrays."""
+    import numpy as np
+    n, T = plan.shape
+    ch_lim, _ = step_limits(bat, buy_mcv)
+    _, dis_lim = step_limits(bat, sell_mcv)
+    out = {k: np.zeros(n) for k in SETTLE_FIELDS if k != "opt_gap_rs"}
+    steps_out = np.zeros(n)
+    s = np.full(n, bat.lo)
+    for t in range(T):
+        want = plan[:, t].astype(int)
+        blocked = ((want > 0) & np.isnan(buy[:, t])) | ((want < 0) & np.isnan(sell[:, t]))
+        out["unfilled_mwh"] += np.where(blocked, grid_mwh(bat, want), 0.0)
+        a = np.where(blocked, 0, want)
+        capped = np.clip(a, -dis_lim[:, t], ch_lim[:, t])
+        out["cut_mwh"] += grid_mwh(bat, a) - grid_mwh(bat, capped)
+        a = np.clip(capped, bat.lo - s, bat.hi - s)
+        cg = np.where(a > 0, grid_mwh(bat, a), 0.0)
+        dg = np.where(a < 0, grid_mwh(bat, a), 0.0)
+        out["bought_mwh"] += cg
+        out["sold_mwh"] += dg
+        out["buy_cost_rs"] += cg * np.nan_to_num(buy[:, t])
+        out["sell_revenue_rs"] += dg * np.nan_to_num(sell[:, t])
+        out["fees_rs"] += (cg + dg) * bat.fee_rs_mwh
+        out["wear_rs"] += dg * bat.wear_rs_mwh
+        steps_out += np.where(a < 0, -a, 0)
+        s = s + a
+    out["stranded_mwh"] = (s - bat.lo) * bat.step_mwh
+    out["profit_rs"] = out["sell_revenue_rs"] - out["buy_cost_rs"] - out["fees_rs"] - out["wear_rs"]
+    out["cycles"] = steps_out / bat.usable_steps
+    return out
+
+
+# ---------------------------------------------------------------- baselines
+#
+# Information rules (docs/baselines.md). Day-ahead plans at 12:00 on D-1 and sees
+# DAM prices through D-1. Real-time plans once at 22:00 on D-1 and sees RTM blocks
+# 1-88 of D-1 (block 89 starts at 22:00, so it is not known yet). selftest checks
+# both against known_at in the database.
+
+EVAL_START = date(2022, 5, 1)       # first evaluated day; April 2022 is warm-up history
+RTM_KNOWN_BLOCKS = 88               # RTM blocks of D-1 known at the 22:00 decision
+BASELINE_STRATEGIES = ["B0", "B1", "B2", "B3", "B4", "PH"]
+FIXED_WINDOWS = (45, 73)            # B0: charge from block 45 (11:00), discharge from block 73 (18:00)
+B1_LOOKBACK_DAYS = 90
+REGIMES = [("Rs 12k cap", date(2022, 4, 3), date(2023, 4, 3)),
+           ("Rs 10k cap", date(2023, 4, 4), date(2025, 12, 31)),
+           ("Rs 10k cap + DAM coupling", date(2026, 1, 1), date(2099, 12, 31))]
+BASELINE_DIR = REPORTS_DIR / "baselines"
+
+
+def load_market_arrays(con):
+    """Actual prices and cleared volumes as (days x 96) arrays per market; NaN = no trade or missing."""
+    import numpy as np
+    import pandas as pd
+    df = pd.read_sql_query(
+        f"SELECT market, delivery_date, block, mcp_rs_mwh AS p, mcv_mw AS v, ({NO_TRADE_SQL}) AS nt"
+        f" FROM blocks_latest", con)
+    df.loc[df.nt == 1, ["p", "v"]] = np.nan
+    last = date.fromisoformat(df.delivery_date.max())
+    days = [d.isoformat() for d in daterange(HISTORY_START, last)]
+    P, V = {}, {}
+    for market in MARKETS:
+        g = df[df.market == market]
+        P[market] = g.pivot(index="delivery_date", columns="block", values="p").reindex(
+            index=days, columns=range(1, 97)).to_numpy()
+        V[market] = g.pivot(index="delivery_date", columns="block", values="v").reindex(
+            index=days, columns=range(1, 97)).to_numpy()
+    return days, P, V
+
+
+def shift_days(A, k):
+    import numpy as np
+    out = np.full_like(A, np.nan)
+    out[k:] = A[:-k]
+    return out
+
+
+def known_value(A, market, k):
+    """For each delivery day, the k-th most recent known value of each block at decision time."""
+    out = shift_days(A, k)
+    if market == "RTM":
+        out[:, RTM_KNOWN_BLOCKS:] = shift_days(A, k + 1)[:, RTM_KNOWN_BLOCKS:]
+    return out
+
+
+def recent_mean(A, market, n_days):
+    import numpy as np
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN blocks stay NaN
+        return np.nanmean(np.stack([known_value(A, market, k) for k in range(1, n_days + 1)]), axis=0)
+
+
+def profile(rule, market, A):
+    """Price (or volume) profile a baseline plans on. Gaps are filled from the 7-day mean."""
+    import numpy as np
+    if rule == "B2":
+        return recent_mean(A, market, 7)
+    out = known_value(A, market, 1) if rule == "B4" else shift_days(A, 7)  # B3: D-7 is fully known
+    fill = recent_mean(A, market, 7)
+    return np.where(np.isnan(out), fill, out)
+
+
+def best_windows(prices, buy_allowed):
+    """Cheapest 2-hour window and the dearest 2-hour window starting after it ends.
+    buy_allowed: bool per block where charging is allowed. Returns (buy_start, sell_start) blocks or None."""
+    import numpy as np
+    w = np.lib.stride_tricks.sliding_window_view(prices, WINDOW_BLOCKS).mean(axis=1)
+    ok_buy = np.lib.stride_tricks.sliding_window_view(buy_allowed, WINDOW_BLOCKS).all(axis=1) & ~np.isnan(w)
+    best, best_buy = None, None
+    for sell in range(WINDOW_BLOCKS, len(w)):
+        cand = sell - WINDOW_BLOCKS
+        if ok_buy[cand] and (best_buy is None or w[cand] < w[best_buy]):
+            best_buy = cand
+        if best_buy is not None and not np.isnan(w[sell]) and (best is None or w[sell] - w[best_buy] > best[2]):
+            best = (best_buy + 1, sell + 1, w[sell] - w[best_buy])
+    return best[:2] if best else None
+
+
+def window_plan(bat, starts):
+    """Fixed-window plans: one full cycle at even power. starts: per-day (buy_start, sell_start) or None."""
+    import numpy as np
+    per_block = bat.usable_steps // WINDOW_BLOCKS
+    plan = np.zeros((len(starts), BLOCKS_PER_DAY), dtype=np.int16)
+    for i, st in enumerate(starts):
+        if st:
+            b, s = st
+            plan[i, b - 1:b - 1 + WINDOW_BLOCKS] = per_block
+            plan[i, s - 1:s - 1 + WINDOW_BLOCKS] = -per_block
+    return plan
+
+
+def monthly_windows(bat, market, A, days):
+    """B1: on each month's first day, pick windows from the last 90 days' known average profile."""
+    import numpy as np
+    import warnings
+    allowed = charge_allowed(bat)
+    starts, cache = [], {}
+    for i, d in enumerate(days):
+        month = d[:7]
+        if month not in cache:
+            rows = [known_value(A[max(0, i - B1_LOOKBACK_DAYS - 2):i + 1], market, k)[-1]
+                    for k in range(1, min(B1_LOOKBACK_DAYS, i) + 1)]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                prof = np.nanmean(np.stack(rows), axis=0) if rows else np.full(BLOCKS_PER_DAY, np.nan)
+            cache[month] = best_windows(prof, allowed)
+        starts.append(cache[month])
+    return starts
+
+
+def run_baseline(strategy, market, bat, days, P, V):
+    """Plan and settle one baseline over all days. Returns the settlement dict."""
+    import numpy as np
+    if market == "BOTH":  # X-PH: buy at the cheaper market, sell at the dearer, with hindsight
+        dam, rtm = P["DAM"], P["RTM"]
+        buy, sell = np.fmin(dam, rtm), np.fmax(dam, rtm)
+        buy_v = np.where(np.isnan(rtm) | (dam <= rtm), V["DAM"], V["RTM"])
+        sell_v = np.where(np.isnan(rtm) | (dam >= rtm), V["DAM"], V["RTM"])
+        ch, _ = step_limits(bat, buy_v)
+        _, dis = step_limits(bat, sell_v)
+        plan, gap = plan_days(bat, buy, sell, ch, dis)
+        return {**settle(bat, plan, buy, sell, buy_v, sell_v), "opt_gap_rs": gap}
+    A, Vm = P[market], V[market]
+    if strategy == "B0":
+        b, s = FIXED_WINDOWS
+        plan = window_plan(bat, [(b, s)] * len(days))
+    elif strategy == "B1":
+        plan = window_plan(bat, monthly_windows(bat, market, A, days))
+    else:
+        prices = A if strategy == "PH" else profile(strategy, market, A)
+        vols = Vm if strategy == "PH" else profile(strategy, market, Vm)
+        ch, dis = step_limits(bat, vols)
+        plan, gap = plan_days(bat, prices, prices, ch, dis)
+        return {**settle(bat, plan, A, A, Vm, Vm), "opt_gap_rs": gap}
+    return {**settle(bat, plan, A, A, Vm, Vm), "opt_gap_rs": np.zeros(len(days))}
+
+
+def run_id_for(strategy, market, bat):
+    prefix = {"DAM": "DA", "RTM": "RT", "BOTH": "X"}[market]
+    sid = f"{prefix}-{strategy}_c{bat.max_cycles}_w{bat.wear_rs_mwh:g}"
+    return sid + ("_solar" if bat.charge_blocks else "")
+
+
+def code_version():
+    import subprocess
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "bess.py"], cwd=ROOT, capture_output=True,
+                               text=True).stdout.strip()
+        if dirty:  # uncommitted edits: fingerprint the file so stale stored runs aren't reused
+            head += "+dirty." + hashlib.sha256((ROOT / "bess.py").read_bytes()).hexdigest()[:8]
+        return head
+    except Exception:
+        return "unknown"
+
+
+def save_run(con, run_id, strategy, market, bat, days, res, version):
+    import pandas as pd
+    daily = pd.DataFrame({"delivery_date": days, **{k: res[k] for k in SETTLE_FIELDS}})
+    daily = daily[daily.delivery_date >= EVAL_START.isoformat()].reset_index(drop=True)
+    settings = json.dumps({**asdict(bat), "eval_start": EVAL_START.isoformat()})
+    con.execute("DELETE FROM results WHERE run_id = ?", (run_id,))
+    con.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+    con.execute("INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (run_id, strategy, market, settings, daily.delivery_date.iloc[0],
+                 daily.delivery_date.iloc[-1], datetime.now().isoformat(sep=" ", timespec="seconds"), version))
+    con.executemany(f"INSERT INTO results VALUES ({', '.join('?' * (len(SETTLE_FIELDS) + 2))})",
+                    [(run_id, *row) for row in daily[["delivery_date", *SETTLE_FIELDS]].itertuples(index=False)])
+    return daily
+
+
+# ---------------------------------------------------------------- backtest reports
+
+def lakh_per_mw_year(profit_rs, n_days, bat):
+    return profit_rs / 1e5 / bat.power_mw / (n_days / 365.25)
+
+
+def run_metrics(daily, ceiling, bat):
+    """Headline numbers for one run. ceiling: the matching perfect-hindsight daily frame."""
+    n = len(daily)
+    profit, gross = daily.profit_rs.sum(), daily.profit_rs.sum() + daily.wear_rs.sum()
+    month = daily.groupby(daily.delivery_date.str[:7]).profit_rs.sum()
+    worst = daily.loc[daily.profit_rs.idxmin()]
+    return {
+        "days": n,
+        "profit_lakh_mw_yr": lakh_per_mw_year(profit, n, bat),
+        "before_wear_lakh_mw_yr": lakh_per_mw_year(gross, n, bat),
+        "capture": profit / ceiling.profit_rs.sum() if ceiling is not None else float("nan"),
+        "losing_days": (daily.profit_rs < 0).mean(),
+        "worst_day": worst.delivery_date,
+        "worst_day_lakh_mw": worst.profit_rs / 1e5 / bat.power_mw,
+        "worst_month": month.idxmin(),
+        "worst_month_lakh_mw": month.min() / 1e5 / bat.power_mw,
+        "cycles_per_day": daily.cycles.mean(),
+        "unfilled_mwh": daily.unfilled_mwh.sum(),
+        "cut_mwh": daily.cut_mwh.sum(),
+        "stranded_mwh": daily.stranded_mwh.sum(),
+        "opt_gap_share": daily.opt_gap_rs.sum() / max(abs(profit), 1.0),
+    }
+
+
+def period_rows(daily, ceiling, bat):
+    """Profit and capture by calendar year and by regime."""
+    rows = []
+    groups = [(y, daily.delivery_date.str[:4] == y) for y in sorted(daily.delivery_date.str[:4].unique())]
+    groups += [(name, (daily.delivery_date >= a.isoformat()) & (daily.delivery_date <= b.isoformat()))
+               for name, a, b in REGIMES]
+    for name, mask in groups:
+        d = daily[mask]
+        if d.empty:
+            continue
+        cap = d.profit_rs.sum() / ceiling[mask].profit_rs.sum() if ceiling is not None else float("nan")
+        rows.append([esc(name), f"{len(d):,}", f"{lakh_per_mw_year(d.profit_rs.sum(), len(d), bat):.1f}",
+                     "–" if cap != cap else f"{cap:.0%}", f"{(d.profit_rs < 0).mean():.1%}",
+                     f"{d.cycles.mean():.2f}"])
+    return rows
+
+
+# IMD seasons, by calendar month
+SEASONS = [("Winter", "Dec–Feb", (12, 1, 2)), ("Summer", "Mar–May", (3, 4, 5)),
+           ("Monsoon", "Jun–Sep", (6, 7, 8, 9)), ("Post-monsoon", "Oct–Nov", (10, 11))]
+
+
+def season_of(delivery_dates):
+    """Season name for each YYYY-MM-DD string (pandas Series)."""
+    month = delivery_dates.str[5:7].astype(int)
+    out = month.map({m: name for name, _, months in SEASONS for m in months})
+    return out
+
+
+def season_metrics(daily, ceiling, bat):
+    """Per-season profit, capture, losing days and cycles. Returns a list of dicts."""
+    seasons = season_of(daily.delivery_date)
+    rows = []
+    for name, months, _ in SEASONS:
+        mask = (seasons == name).to_numpy()
+        d = daily[mask]
+        if d.empty:
+            continue
+        cap = d.profit_rs.sum() / ceiling[mask].profit_rs.sum() if ceiling is not None else float("nan")
+        rows.append({"season": name, "months": months, "days": len(d),
+                     "profit_k_mw_day": d.profit_rs.mean() / 1e3 / bat.power_mw,
+                     "lakh_mw_yr_rate": lakh_per_mw_year(d.profit_rs.sum(), len(d), bat),
+                     "capture": cap, "losing_days": (d.profit_rs < 0).mean(),
+                     "cycles_per_day": d.cycles.mean()})
+    return rows
+
+
+def png_base64(fig):
+    import base64
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, facecolor=fig.get_facecolor())
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def monthly_chart(daily, ceiling, bat, title):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    surface, ink, muted, grid = "#fcfcfb", "#1d1d1b", "#6b6a64", "#e4e1d8"
+    fig, ax = plt.subplots(figsize=(10, 3.6), facecolor=surface)
+    ax.set_facecolor(surface)
+    series = [(daily, "#2a78d6", "This run")]
+    if ceiling is not None:
+        series.append((ceiling, "#eb6834", "Perfect hindsight"))
+    for df, color, label in series:
+        m = df.groupby(df.delivery_date.str[:7]).profit_rs.sum() / 1e5 / bat.power_mw
+        x = pd.to_datetime(m.index + "-01")
+        ax.plot(x, m.values, color=color, lw=2, label=label)
+    ax.set_title(title, loc="left", fontsize=11, color=ink)
+    ax.set_ylabel("₹ lakh per MW per month", color=muted, fontsize=9)
+    ax.grid(axis="y", color=grid, lw=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(grid)
+    ax.tick_params(colors=muted, labelsize=9, length=0)
+    ax.axhline(0, color=muted, lw=0.8)
+    if len(series) > 1:
+        ax.legend(frameon=False, fontsize=9, labelcolor=ink, loc="upper left")
+    fig.tight_layout()
+    data = png_base64(fig)
+    plt.close(fig)
+    return data
+
+
+def write_run_report(run_id, strategy, market, bat, daily, ceiling, version, out_dir=BASELINE_DIR):
+    folder = out_dir / run_id
+    folder.mkdir(parents=True, exist_ok=True)
+    daily.round(2).to_csv(folder / "daily.csv", index=False)
+    m = run_metrics(daily, ceiling, bat)
+    tiles = [("Profit, ₹ lakh/MW/yr", f"{m['profit_lakh_mw_yr']:.1f}"),
+             ("Before wear", f"{m['before_wear_lakh_mw_yr']:.1f}"),
+             ("Capture of ceiling", "–" if m["capture"] != m["capture"] else f"{m['capture']:.0%}"),
+             ("Losing days", f"{m['losing_days']:.1%}"),
+             ("Cycles per day", f"{m['cycles_per_day']:.2f}")]
+    month_of_year = daily.groupby(daily.delivery_date.str[5:7]).profit_rs.mean() / 1e3 / bat.power_mw
+    charge = "any time" if not bat.charge_blocks else \
+        f"{block_label(bat.charge_blocks[0])}–{block_label(bat.charge_blocks[1] + 1)} only"
+    settings = (f"{bat.power_mw:g} MW / {bat.energy_mwh:g} MWh · RTE {bat.rte:.0%} · SoC {bat.soc_min:.0%}–"
+                f"{bat.soc_max:.0%} · {bat.max_cycles} cycle(s)/day · fee ₹{bat.fee_rs_mwh:g}/MWh each side · "
+                f"wear ₹{bat.wear_rs_mwh:g}/MWh · participation ≤ {bat.participation:.0%} of cleared volume · "
+                f"charging {charge}")
+    chart = monthly_chart(daily, ceiling, bat, "Monthly profit")
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(run_id)}</title><style>{HEALTH_CSS}
+.tiles {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }}
+.tile {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }}
+.tile b {{ display:block; font-size:22px; }} .tile span {{ color:var(--muted); font-size:13px; }}
+img {{ max-width:100%; height:auto; border:1px solid var(--line); border-radius:8px; }}
+</style></head><body><main>
+<p class="sub"><a href="../summary.html">← all baselines</a></p>
+<h1>{esc(run_id)}</h1>
+<p class="sub">{esc(BASELINE_DESCRIPTIONS.get(strategy, strategy))} · market {market} ·
+{daily.delivery_date.iloc[0]} to {daily.delivery_date.iloc[-1]} ({len(daily):,} days) · code {esc(version)}</p>
+<p class="note">{esc(settings)}</p>
+<div class="tiles">{"".join(f'<div class="tile"><b>{v}</b><span>{esc(k)}</span></div>' for k, v in tiles)}</div>
+<h2>Monthly profit</h2><img alt="Monthly profit" src="data:image/png;base64,{chart}">
+<h2>By year and regime</h2>
+{html_table(["Period", "Days", "₹ lakh/MW/yr", "Capture", "Losing days", "Cycles/day"], period_rows(daily, ceiling, bat))}
+<h2>By season</h2>
+{html_table(["Season", "Months", "Days", "₹ thousand/MW/day", "Annual rate, ₹ lakh/MW/yr", "Capture",
+             "Losing days", "Cycles/day"],
+            [[r["season"], r["months"], f'{r["days"]:,}', f'{r["profit_k_mw_day"]:.1f}', f'{r["lakh_mw_yr_rate"]:.1f}',
+              "–" if r["capture"] != r["capture"] else f'{r["capture"]:.0%}', f'{r["losing_days"]:.1%}',
+              f'{r["cycles_per_day"]:.2f}'] for r in season_metrics(daily, ceiling, bat)])}
+<p class="note">Annual rate = the season's average daily profit × 365, for comparing seasons on the same scale.</p>
+<h2>Average profit per day by calendar month (₹ thousand per MW)</h2>
+{html_table(["Month", *[date(2000, int(k), 1).strftime("%b") for k in month_of_year.index]],
+            [["Avg", *[f"{v:,.1f}" for v in month_of_year.values]]])}
+<h2>Operations</h2>
+{html_table(["Measure", "Value"], [
+    ["Worst day", f"{m['worst_day']} (₹{m['worst_day_lakh_mw'] * 1e5:,.0f} per MW)"],
+    ["Worst month", f"{m['worst_month']} (₹{m['worst_month_lakh_mw']:.2f} lakh per MW)"],
+    ["Energy bought / sold", f"{daily.bought_mwh.sum():,.0f} / {daily.sold_mwh.sum():,.0f} MWh"],
+    ["Unfilled (no-trade blocks)", f"{m['unfilled_mwh']:,.0f} MWh"],
+    ["Cut by participation limit", f"{m['cut_mwh']:,.0f} MWh"],
+    ["Left in battery at day end (valued 0)", f"{m['stranded_mwh']:,.0f} MWh"],
+    ["Optimiser gap bound (best possible plan on the planned prices could earn at most this much more)",
+     f"{m['opt_gap_share']:.2%} of profit"]])}
+<p class="note">Daily results: daily.csv in this folder, and the results table in power.db (run_id {esc(run_id)}).</p>
+</main></body></html>"""
+    (folder / "report.html").write_text(html, "utf-8")
+    return m
+
+
+BASELINE_DESCRIPTIONS = {
+    "B0": "Fixed windows: charge 11:00–13:00, discharge 18:00–20:00 every day",
+    "B1": "Monthly windows: best 2-hour buy/sell windows from the last 90 days, re-picked each month",
+    "B2": "7-day average profile, then optimiser",
+    "B3": "Same weekday last week (D–7), then optimiser",
+    "B4": "Yesterday's prices, then optimiser",
+    "PH": "Perfect hindsight (ceiling): optimiser on the actual prices",
+}
+
+SCENARIOS = [  # (label, wear Rs/MWh, charge_blocks)
+    ("base, no wear", 0.0, None),
+    ("base, wear ₹300/MWh", 300.0, None),
+    ("charging 10:00–15:00 only, wear ₹300/MWh", 300.0, (41, 60)),
+]
+
+
+def baseline_checks(table):
+    """Spec checks 1, 2, 3 and 6 on the finished runs. table: {run_id: daily frame}."""
+    import numpy as np
+    findings = []
+
+    def daily_profit(rid):
+        return table[rid].profit_rs.to_numpy() if rid in table else None
+
+    for rid, df in table.items():
+        prefix, rest = rid.split("-", 1)
+        strat, tail = rest.split("_", 1)
+        if prefix == "X" or strat == "PH":
+            continue
+        ph = table.get(f"{prefix}-PH_{tail}")
+        if ph is not None:  # the exact ceiling is at most PH profit + its proven optimiser gap
+            bad = int((df.profit_rs.to_numpy() > ph.profit_rs.to_numpy() + ph.opt_gap_rs.to_numpy() + 1.0).sum())
+            findings.append(("1 ceiling >= baseline", rid, bad))
+    # Ceiling comparisons allow for each ceiling's proven optimiser gap: exact optimum
+    # lies in [profit, profit + opt_gap_rs].
+    upper = lambda rid: table[rid].profit_rs.to_numpy() + table[rid].opt_gap_rs.to_numpy()
+    for rid in table:
+        if rid.startswith("X-PH"):
+            tail = rid.split("_", 1)[1]
+            for m in ("DA", "RT"):
+                other = daily_profit(f"{m}-PH_{tail}")
+                if other is not None:
+                    findings.append(("2 X-PH >= single-market PH", f"{rid} vs {m}",
+                                     int((upper(rid) < other - 1.0).sum())))
+        if "_c2_" in rid and rid.split("-")[1].startswith("PH"):
+            one = daily_profit(rid.replace("_c2_", "_c1_"))
+            if one is not None:
+                findings.append(("6 2-cycle ceiling >= 1-cycle", rid, int((upper(rid) < one - 1.0).sum())))
+        # Only for ceilings: a forecast-based plan made more cautious by wear can earn more.
+        if "_w0" in rid and "PH_" in rid:
+            heavy = rid.replace("_w0", "_w300")
+            if heavy in table:
+                worse = table[heavy].profit_rs.sum() > upper(rid).sum() + 1.0
+                findings.append(("3 more wear never raises the ceiling's profit", rid, int(worse)))
+    return findings
+
+
+def write_summary(rows, checks, bat_default, out_dir=BASELINE_DIR, title="Baseline backtests"):
+    import pandas as pd
+    summary = pd.DataFrame(rows)
+    summary.to_csv(out_dir / "summary.csv", index=False)
+    parts = []
+    for label, group in summary.groupby("scenario", sort=False):
+        table = [[f'<a href="{r.run_id}/report.html">{esc(r.run_id)}</a>',
+                  esc(BASELINE_DESCRIPTIONS.get(r.strategy, r.strategy) if r.market != "BOTH"
+                      else "Perfect hindsight, best market per block"),
+                  r.market, str(r.cycles), f"{r.profit_lakh_mw_yr:.1f}", f"{r.before_wear_lakh_mw_yr:.1f}",
+                  "–" if r.capture != r.capture else f"{r.capture:.0%}", f"{r.losing_days:.1%}",
+                  f"{r.cycles_per_day:.2f}"] for r in group.itertuples()]
+        parts.append(f"<h2>{esc(label)}</h2>" + html_table(
+            ["Run", "Strategy", "Market", "Cycle limit", "₹ lakh/MW/yr", "Before wear", "Capture",
+             "Losing days", "Cycles/day"], table))
+    check_rows = [[esc(c), esc(r), f'<span class="{"pass" if n == 0 else "fail"}">{n}</span>']
+                  for c, r, n in checks]
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)}</title><style>{HEALTH_CSS}</style></head><body><main>
+<h1>{esc(title)}</h1>
+<p class="sub">{summary.first_date.min()} to {summary.last_date.max()} · {bat_default.power_mw:g} MW / {bat_default.energy_mwh:g} MWh ·
+spec: docs/baselines.md · generated {datetime.now():%d %b %Y %H:%M}</p>
+<p class="sub"><a href="seasons.html">Results by season →</a></p>
+<p class="note">Capture = profit ÷ perfect-hindsight profit in the same market, cycle limit and scenario.
+Profit is after fees and wear, before transmission charges and operating costs.</p>
+{"".join(parts)}
+<h2>Result checks (findings per check; 0 = pass)</h2>
+{html_table(["Check", "Runs", "Days or cases failing"], check_rows)}
+</main></body></html>"""
+    (out_dir / "summary.html").write_text(html, "utf-8")
+
+
+def write_season_summary(table, out_dir, title):
+    """seasons.csv (one row per run and season) and seasons.html (runs x seasons)."""
+    import pandas as pd
+    rows = []
+    for rid, daily in table.items():
+        prefix, rest = rid.split("-", 1)
+        strategy, tail = rest.split("_", 1)
+        cycles, wear = int(tail.split("_")[0][1:]), float(tail.split("_")[1][1:])
+        charge = (41, 60) if tail.endswith("_solar") else None
+        bat = Battery(wear_rs_mwh=wear, max_cycles=cycles, charge_blocks=charge)
+        ceiling = table.get(f"{prefix}-PH_{tail}") if strategy != "PH" else None
+        scenario = next(lbl for lbl, w, c in SCENARIOS if w == wear and c == charge)
+        for r in season_metrics(daily, ceiling, bat):
+            rows.append({"run_id": rid, "scenario": scenario, "strategy": strategy, "cycles": cycles, **r})
+    df = pd.DataFrame(rows)
+    df.round(4).to_csv(out_dir / "seasons.csv", index=False)
+    names = [name for name, _, _ in SEASONS if name in set(df.season)]
+    parts = []
+    for scenario, g in df.groupby("scenario", sort=False):
+        body = []
+        for rid, r in g.groupby("run_id", sort=False):
+            r = r.set_index("season")
+            cells = []
+            for name in names:
+                if name not in r.index:
+                    cells.append("–")
+                    continue
+                x = r.loc[name]
+                cap = "" if x.capture != x.capture else f" · {x.capture:.0%}"
+                cells.append(f"{x.profit_k_mw_day:.1f}{cap}")
+            body.append([f'<a href="{rid}/report.html">{esc(rid)}</a>', *cells])
+        parts.append(f"<h2>{esc(scenario)}</h2>" + html_table(
+            ["Run", *[f"{n} ({m})" for n, m, _ in SEASONS if n in names]], body))
+    days = df.drop_duplicates("season").set_index("season").days
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)}: seasons</title><style>{HEALTH_CSS}</style></head><body><main>
+<p class="sub"><a href="summary.html">← summary</a></p>
+<h1>{esc(title)}: by season</h1>
+<p class="sub">Each cell: average profit in ₹ thousand per MW per day · capture of the perfect-hindsight
+ceiling in the same season. Days per season: {", ".join(f"{n} {days[n]:,}" for n in names)}.</p>
+{"".join(parts)}
+<p class="note">Seasons follow IMD: winter Dec–Feb, summer Mar–May, monsoon Jun–Sep, post-monsoon Oct–Nov.
+Data in seasons.csv, with the annual-rate equivalent (daily average × 365).</p>
+</main></body></html>"""
+    (out_dir / "seasons.html").write_text(html, "utf-8")
+
+
+def stored_run(run_id, bat, version, last_day):
+    """A previously stored run with the same settings, code and data range, or None."""
+    import pandas as pd
+    settings = json.dumps({**asdict(bat), "eval_start": EVAL_START.isoformat()})
+    with connect() as con:
+        hit = con.execute("SELECT 1 FROM runs WHERE run_id = ? AND settings = ? AND code_version = ?"
+                          " AND last_date = ?", (run_id, settings, version, last_day)).fetchone()
+        if not hit:
+            return None
+        return pd.read_sql_query(f"SELECT delivery_date, {', '.join(SETTLE_FIELDS)} FROM results"
+                                 f" WHERE run_id = ? ORDER BY delivery_date", con, params=(run_id,))
+
+
+def cmd_baselines(args):
+    import time as _t
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    version = code_version()
+    with connect() as con:
+        con.executescript(SCHEMA)
+        days, P, V = load_market_arrays(con)
+    table = {}
+    for label, wear, charge in SCENARIOS:
+        print(f"{label}:")
+        for market in ("DAM", "RTM", "BOTH"):
+            for strategy in (["PH"] if market == "BOTH" else BASELINE_STRATEGIES):
+                for cycles in ((1,) if strategy in ("B0", "B1") else (1, 2)):
+                    bat = Battery(wear_rs_mwh=wear, max_cycles=cycles, charge_blocks=charge)
+                    rid = run_id_for(strategy, market, bat)
+                    t0 = _t.time()
+                    daily = None if args.force else stored_run(rid, bat, version, days[-1])
+                    if daily is None:
+                        res = run_baseline(strategy, market, bat, days, P, V)
+                        with connect() as con:
+                            daily = save_run(con, rid, strategy, market, bat, days, res, version)
+                    else:
+                        print(f"  {rid:28} already stored for this code and data")
+                        table[rid] = daily
+                        continue
+                    table[rid] = daily
+                    print(f"  {rid:28} {lakh_per_mw_year(daily.profit_rs.sum(), len(daily), bat):6.1f} "
+                          f"lakh/MW/yr  ({_t.time() - t0:.0f}s)")
+    write_baseline_reports(table, {rid: version for rid in table}, BASELINE_DIR, "Baseline backtests")
+
+
+def write_baseline_reports(table, versions, out_dir, title):
+    """Per-run reports, summary and result checks for {run_id: daily frame} into out_dir.
+    Reports need each run's ceiling, so they are written once all runs are in the table."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for rid, daily in table.items():
+        prefix, rest = rid.split("-", 1)
+        strategy, tail = rest.split("_", 1)
+        market = {"DA": "DAM", "RT": "RTM", "X": "BOTH"}[prefix]
+        cycles = int(tail.split("_")[0][1:])
+        wear = float(tail.split("_")[1][1:])
+        charge = (41, 60) if tail.endswith("_solar") else None
+        bat = Battery(wear_rs_mwh=wear, max_cycles=cycles, charge_blocks=charge)
+        ceiling = table.get(f"{prefix}-PH_{tail}") if strategy != "PH" else None
+        m = write_run_report(rid, strategy, market, bat, daily, ceiling, versions[rid], out_dir)
+        label = next(lbl for lbl, w, c in SCENARIOS if w == wear and c == charge)
+        rows.append({"run_id": rid, "scenario": label, "strategy": strategy, "market": market,
+                     "cycles": cycles, "wear_rs_mwh": wear, "charging": "10-15h" if charge else "any",
+                     "first_date": daily.delivery_date.iloc[0], "last_date": daily.delivery_date.iloc[-1],
+                     **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in m.items()}})
+    checks = baseline_checks(table)
+    write_summary(rows, checks, Battery(), out_dir, title)
+    write_season_summary(table, out_dir, title)
+    failed = [c for c in checks if c[2]]
+    print(f"wrote {out_dir.relative_to(ROOT)}/summary.html, summary.csv and {len(table)} run folders")
+    print(f"result checks: {len(checks) - len(failed)} passed, {len(failed)} with findings")
+    for c, r, n in failed:
+        print(f"  {c}: {r}: {n}")
+
+
+def cmd_baseline_report(args):
+    """Rebuild baseline reports for a date window from the stored daily results.
+    Each day is simulated independently (start and end at soc_min, planning only on earlier
+    prices), so a window's results are exactly the stored days in it; nothing is re-simulated."""
+    import pandas as pd
+    first = args.start or EVAL_START.isoformat()
+    with connect() as con:
+        runs = pd.read_sql_query("SELECT run_id, code_version FROM runs ORDER BY rowid", con)
+        if runs.empty:
+            sys.exit("no stored runs; run `python bess.py baselines` first")
+        last = args.end or con.execute("SELECT MAX(delivery_date) FROM results").fetchone()[0]
+        res = pd.read_sql_query(
+            f"SELECT run_id, delivery_date, {', '.join(SETTLE_FIELDS)} FROM results"
+            f" WHERE delivery_date BETWEEN ? AND ? ORDER BY run_id, delivery_date", con, params=(first, last))
+    table = {rid: g.drop(columns="run_id").reset_index(drop=True)
+             for rid, g in res.groupby("run_id", sort=False)}
+    table = {rid: table[rid] for rid in runs.run_id if rid in table}
+    out_dir = Path(args.out).resolve() if args.out else REPORTS_DIR / f"baselines_{first}_{last}"
+    title = args.title or f"Baseline backtests, {first} to {last}"
+    write_baseline_reports(table, dict(zip(runs.run_id, runs.code_version)), out_dir, title)
+
+
+# ---------------------------------------------------------------- self-tests
+
+def cmd_selftest(args):
+    """Checks that don't depend on results: optimiser, look-ahead, known_at, a hand-computed day."""
+    import numpy as np
+    failures = []
+
+    def check(name, ok, detail=""):
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}{(': ' + detail) if detail and not ok else ''}")
+        if not ok:
+            failures.append(name)
+
+    bat = Battery()
+    # 1. Optimiser on a day with one obvious cycle
+    p = np.full((1, 96), 5000.0)
+    p[0, 40:48], p[0, 72:80] = 1000.0, 10000.0
+    ch, dis = step_limits(bat, np.full((1, 96), np.nan))
+    plan, _ = plan_days(bat, p, p, ch, dis)
+    res = settle(bat, plan, p, p, np.full((1, 96), np.nan), np.full((1, 96), np.nan))
+    usable = bat.usable_steps * bat.step_mwh
+    expected = usable * bat.eta * (10000 - 20) - usable / bat.eta * (1000 + 20)
+    check("optimiser finds the obvious cycle", abs(res["profit_rs"][0] - expected) < 1, f"{res['profit_rs'][0]:.0f} vs {expected:.0f}")
+    check("plan ends at the SoC floor", int(plan.sum()) == 0)
+    # 2. Cycle limit holds, and 2 cycles >= 1 cycle
+    rng = np.random.default_rng(0)
+    p = rng.uniform(1000, 10000, (20, 96))
+    ch, dis = step_limits(bat, np.full_like(p, np.nan))
+    one, gap1 = plan_days(bat, p, p, ch, dis)
+    two, _ = plan_days(replace(bat, max_cycles=2), p, p, ch, dis)
+    check("cycle limit respected", (discharged_steps(one) <= bat.usable_steps).all()
+          and (discharged_steps(two) <= 2 * bat.usable_steps).all())
+    nan = np.full_like(p, np.nan)
+    profit = lambda plan: settle(bat, plan, p, p, nan, nan)["profit_rs"]
+    exact = profit(optimise_exact(bat, p, p, ch, dis, bat.usable_steps))
+    short = exact - profit(one)
+    check("optimiser shortfall vs exact is within its reported bound", (short <= gap1 + 1).all() and (short >= -1).all(),
+          f"max excess Rs {(short - gap1).max():.0f}")
+    check("optimiser is within 1% of exact on every day", (short <= 0.01 * np.abs(exact) + 1).all(),
+          f"max shortfall {(short / exact).max():.2%}")
+    check("2-cycle profit >= 1-cycle profit", (settle(bat, two, p, p, nan, nan)["profit_rs"]
+                                                >= settle(bat, one, p, p, nan, nan)["profit_rs"] - 1).all())
+    # 3. Look-ahead: corrupting data from day i on never changes what day i's baselines see
+    with connect() as con:
+        days, P, V = load_market_arrays(con)
+    for market in MARKETS:
+        A = P[market]
+        for i in (100, 800, len(days) - 5):
+            bad = A.copy()
+            bad[i:] = rng.uniform(0, 20000, bad[i:].shape)
+            same = all(np.array_equal(profile(r, market, A)[i], profile(r, market, bad)[i], equal_nan=True)
+                       for r in ("B2", "B3", "B4"))
+            w_good = monthly_windows(bat, market, A[:i + 1], days[:i + 1])[-1]
+            w_bad = monthly_windows(bat, market, bad[:i + 1], days[:i + 1])[-1]
+            check(f"look-ahead: {market} day {days[i]} unaffected by its own and later prices",
+                  same and w_good == w_bad)
+    # 4. Information rules agree with known_at in the database
+    with connect() as con:
+        q = lambda sql: con.execute(sql).fetchone()[0]
+        check("DAM day D is known before 12:00 on D (decision for D+1)",
+              q("SELECT COUNT(*) FROM blocks WHERE market='DAM' AND known_at >= delivery_date || ' 12:00:00'") == 0)
+        check(f"RTM blocks 1-{RTM_KNOWN_BLOCKS} of D are known before 22:00 on D",
+              q(f"SELECT COUNT(*) FROM blocks WHERE market='RTM' AND block <= {RTM_KNOWN_BLOCKS}"
+                f" AND known_at >= delivery_date || ' 22:00:00'") == 0)
+        check(f"RTM blocks {RTM_KNOWN_BLOCKS + 1}-96 of D are not known at 22:00 on D (so D-2 is used)",
+              q(f"SELECT COUNT(*) FROM blocks WHERE market='RTM' AND block > {RTM_KNOWN_BLOCKS}"
+                f" AND known_at < delivery_date || ' 22:00:00'") == 0)
+    # 5. DA-B0 on 29 Sep 2026, computed by hand
+    i = days.index("2026-09-29")
+    A, Vm = P["DAM"][i:i + 1], V["DAM"][i:i + 1]
+    res = settle(bat, window_plan(bat, [FIXED_WINDOWS]), A, A, Vm, Vm)
+    per_block = bat.usable_steps // WINDOW_BLOCKS * bat.step_mwh  # stored MWh per block
+    b, s = FIXED_WINDOWS
+    buy = sum(per_block / bat.eta * (A[0, k] + 20) for k in range(b - 1, b + 7))
+    sell = sum(per_block * bat.eta * (A[0, k] - 20) for k in range(s - 1, s + 7))
+    check("DA-B0 on 2026-09-29 matches a hand calculation", abs(res["profit_rs"][0] - (sell - buy)) < 1,
+          f"{res['profit_rs'][0]:.0f} vs {sell - buy:.0f}")
+    print(f"{'all checks passed' if not failures else f'{len(failures)} check(s) failed'}")
+    if failures:
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_init(args):
@@ -887,6 +1866,16 @@ def main(argv=None):
     p.add_argument("--to", dest="end", help="YYYY-MM-DD, default last day loaded")
     p.add_argument("--out", help="CSV path, default reports/export_<market>_<from>_<to>.csv")
     p.set_defaults(func=cmd_export)
+    p = sub.add_parser("baselines", help="run every baseline (docs/baselines.md), write reports/baselines/")
+    p.add_argument("--force", action="store_true", help="recompute runs already stored for this code")
+    p.set_defaults(func=cmd_baselines)
+    p = sub.add_parser("baseline-report", help="rebuild baseline reports for a date window from stored results")
+    p.add_argument("--from", dest="start", help="YYYY-MM-DD, default 2022-05-01")
+    p.add_argument("--to", dest="end", help="YYYY-MM-DD, default last day stored")
+    p.add_argument("--out", help="folder, default reports/baselines_<from>_<to>")
+    p.add_argument("--title", help="report title")
+    p.set_defaults(func=cmd_baseline_report)
+    sub.add_parser("selftest", help="optimiser, look-ahead and information checks").set_defaults(func=cmd_selftest)
     args = parser.parse_args(argv)
     args.func(args)
 
