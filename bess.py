@@ -1232,8 +1232,6 @@ EVAL_START = date(2022, 5, 1)       # first evaluated day; April 2022 is warm-up
 RTM_KNOWN_BLOCKS = 88               # RTM blocks of D-1 known at the 22:00 decision
 BASELINE_STRATEGIES = ["B0", "B1", "B2", "B3", "B4", "PH"]
 FIXED_WINDOWS = (45, 73)            # B0: charge from block 45 (11:00), discharge from block 73 (18:00)
-SIMPLE_RULE_CHARGE = 53             # S1, the "1pm / 10pm rule": charge from 13:00 and discharge in the
-                                    # last window of the day (22:00-24:00 for a 2-hour battery)
 B1_LOOKBACK_DAYS = 90
 REGIMES = [("Rs 12k cap", date(2022, 4, 3), date(2023, 4, 3)),
            ("Rs 10k cap", date(2023, 4, 4), date(2025, 12, 31)),
@@ -1348,9 +1346,103 @@ def monthly_windows(bat, market, A, days):
     return starts
 
 
+def realtime_forecast(P):
+    """Forecast of day D's real-time prices at 22:00 on D-1: the mean of day D's day-ahead prices
+    (public from 15:00 on D-1) and the 7-day real-time average known then. Either one alone
+    forecasts worse (tested 2 Nov 2026: planning re-runs on day-ahead prices alone, or on them
+    plus the recent real-time minus day-ahead gap, earned less than day-ahead alone)."""
+    import numpy as np
+    dam = P["DAM"]
+    rt7 = recent_mean(P["RTM"], "RTM", 7)
+    return np.where(np.isnan(rt7), dam, np.where(np.isnan(dam), rt7, 0.5 * dam + 0.5 * rt7))
+
+
+def two_stage_plans(bat, P, V):
+    """T1's two plans: the day-ahead commitment (B2, made at 12:00 on D-1) and the physical
+    schedule re-planned at 22:00 on D-1 on realtime_forecast."""
+    dav = profile("B2", "DAM", V["DAM"])
+    ch, dis = step_limits(bat, dav)
+    da_prof = profile("B2", "DAM", P["DAM"])
+    da_plan, _ = plan_days(bat, da_prof, da_prof, ch, dis)
+    fc = realtime_forecast(P)
+    ch2, dis2 = step_limits(bat, profile("B2", "RTM", V["RTM"]))
+    phys_plan, gap = plan_days(bat, fc, fc, ch2, dis2)
+    return da_plan, phys_plan, gap
+
+
+def two_stage(bat, P, V):
+    """T1, both markets without look-ahead.
+    Stage 1, 12:00 on D-1: commit a day-ahead plan made on the 7-day average (B2).
+    Stage 2, 22:00 on D-1: re-plan the battery's physical schedule on realtime_forecast, and
+    trade the difference from the day-ahead position in real-time. The day-ahead leg settles at
+    DAM prices, the adjustment at RTM prices, with fees on both legs and wear on physical
+    discharge. Where real-time did not trade, no adjustment fills: the battery keeps to its
+    day-ahead plan in that block (clipped to what is stored), and any unavoidable difference is
+    logged as unfilled and valued at 0."""
+    import numpy as np
+    dam, rtm = P["DAM"], P["RTM"]
+    da_plan, phys_plan, gap = two_stage_plans(bat, P, V)
+    n, T = da_plan.shape
+    out = {k: np.zeros(n) for k in SETTLE_FIELDS if k != "opt_gap_rs"}
+    steps_out = np.zeros(n)
+    s = np.full(n, bat.lo)
+    for t in range(T):
+        pd_, pr = dam[:, t], rtm[:, t]
+        da_g = grid_mwh(bat, da_plan[:, t]) * np.sign(da_plan[:, t])      # + buy, - sell
+        da_fill = ~np.isnan(pd_) | (da_plan[:, t] == 0)
+        out["unfilled_mwh"] += np.where(da_fill, 0.0, np.abs(da_g))
+        da_g = np.where(da_fill, da_g, 0.0)
+        rt_ok = ~np.isnan(pr)
+        a = np.where(rt_ok, phys_plan[:, t], da_plan[:, t]).astype(int)
+        a = np.clip(a, bat.lo - s, bat.hi - s)
+        g = grid_mwh(bat, a) * np.sign(a)
+        adj = g - da_g
+        forced = ~rt_ok & (np.abs(adj) > 1e-9)
+        out["unfilled_mwh"] += np.where(forced, np.abs(adj), 0.0)
+        adj = np.where(rt_ok, adj, 0.0)
+        p_da, p_rt = np.nan_to_num(pd_), np.nan_to_num(pr)
+        out["buy_cost_rs"] += np.clip(da_g, 0, None) * p_da + np.clip(adj, 0, None) * p_rt
+        out["sell_revenue_rs"] += np.clip(-da_g, 0, None) * p_da + np.clip(-adj, 0, None) * p_rt
+        out["fees_rs"] += (np.abs(da_g) + np.abs(adj)) * bat.fee_rs_mwh
+        out["bought_mwh"] += np.clip(g, 0, None)
+        out["sold_mwh"] += np.clip(-g, 0, None)
+        out["wear_rs"] += np.clip(-g, 0, None) * bat.wear_rs_mwh
+        steps_out += np.where(a < 0, -a, 0)
+        s = s + a
+    out["stranded_mwh"] = (s - bat.lo) * bat.step_mwh
+    out["profit_rs"] = out["sell_revenue_rs"] - out["buy_cost_rs"] - out["fees_rs"] - out["wear_rs"]
+    out["cycles"] = steps_out / bat.usable_steps
+    return {**out, "opt_gap_rs": gap}
+
+
+def market_choice(P):
+    """XF's forecasts at 12:00 on D-1: day-ahead from the 7-day average (B2); real-time from days
+    D-2 to D-8, which are complete by then. Each block is bought in the market forecast cheaper
+    and sold in the one forecast dearer."""
+    import numpy as np
+    import warnings
+    fda = profile("B2", "DAM", P["DAM"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        frt = np.nanmean(np.stack([shift_days(P["RTM"], k) for k in range(2, 9)]), axis=0)
+    buy_rt, sell_rt = frt < fda, frt > fda
+    return np.where(buy_rt, frt, fda), np.where(sell_rt, frt, fda), buy_rt, sell_rt
+
+
 def run_baseline(strategy, market, bat, days, P, V):
     """Plan and settle one baseline over all days. Returns the settlement dict."""
     import numpy as np
+    if market == "BOTH" and strategy == "T1":
+        return two_stage(bat, P, V)
+    if market == "BOTH" and strategy == "XF":
+        bf, sf, buy_rt, sell_rt = market_choice(P)
+        vb = np.where(buy_rt, V["RTM"], V["DAM"])
+        vs = np.where(sell_rt, V["RTM"], V["DAM"])
+        ch, _ = step_limits(bat, profile("B2", "DAM", V["DAM"]))
+        _, dis = step_limits(bat, profile("B2", "DAM", V["DAM"]))
+        plan, gap = plan_days(bat, bf, sf, ch, dis)
+        return {**settle(bat, plan, np.where(buy_rt, P["RTM"], P["DAM"]), np.where(sell_rt, P["RTM"], P["DAM"]), vb, vs),
+                "opt_gap_rs": gap}
     if market == "BOTH":  # X-PH: buy at the cheaper market, sell at the dearer, with hindsight
         dam, rtm = P["DAM"], P["RTM"]
         buy, sell = np.fmin(dam, rtm), np.fmax(dam, rtm)
@@ -1364,8 +1456,6 @@ def run_baseline(strategy, market, bat, days, P, V):
     if strategy == "B0":
         b, s = FIXED_WINDOWS
         plan = window_plan(bat, [(b, s)] * len(days))
-    elif strategy == "S1":
-        plan = window_plan(bat, [(SIMPLE_RULE_CHARGE, BLOCKS_PER_DAY + 1 - window_blocks(bat))] * len(days))
     elif strategy == "B1":
         plan = window_plan(bat, monthly_windows(bat, market, A, days))
     else:
@@ -1881,6 +1971,26 @@ def cmd_selftest(args):
             w_bad = monthly_windows(bat, market, bad[:i + 1], days[:i + 1])[-1]
             check(f"look-ahead: {market} day {days[i]} unaffected by its own and later prices",
                   same and w_good == w_bad)
+    # 3b. Two-market strategies: day D's plans use day D's day-ahead prices (public at 15:00 on D-1)
+    # but nothing later, and real-time only as known at 22:00 on D-1 (T1) or 12:00 on D-1 (XF)
+    small = Battery(soc_step=0.02)
+    for i in (300, len(days) - 5):
+        sl = slice(i - 12, i + 1)
+        Pw = {m: P[m][sl].copy() for m in MARKETS}
+        Vw = {m: V[m][sl].copy() for m in MARKETS}
+        bad = {m: Pw[m].copy() for m in MARKETS}
+        bad["RTM"][-1] = rng.uniform(0, 20000, 96)                      # day D real-time
+        bad["RTM"][-2, RTM_KNOWN_BLOCKS:] = rng.uniform(0, 20000, 96 - RTM_KNOWN_BLOCKS)  # D-1 after 22:00
+        a = two_stage_plans(small, Pw, Vw)
+        b = two_stage_plans(small, bad, Vw)
+        xa, xb = market_choice(Pw), market_choice(bad)
+        bad2 = {m: bad[m].copy() for m in MARKETS}
+        bad2["RTM"][-2] = rng.uniform(0, 20000, 96)                      # all of D-1 real-time
+        xc = market_choice(bad2)
+        check(f"look-ahead: T1 on {days[i]} unaffected by real-time after 22:00 on D-1",
+              np.array_equal(a[0][-1], b[0][-1]) and np.array_equal(a[1][-1], b[1][-1]))
+        check(f"look-ahead: XF on {days[i]} unaffected by real-time after 12:00 on D-1",
+              all(np.array_equal(p[-1], q[-1], equal_nan=True) for p, q in zip(xa, xc)))
     # 4. Information rules agree with known_at in the database
     with connect() as con:
         q = lambda sql: con.execute(sql).fetchone()[0]

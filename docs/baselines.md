@@ -112,6 +112,24 @@ These are the same rules applied to real-time prices, with the real-time decisio
 - **Tests:** the most that using both markets could add. It's an upper bound, not
   achievable: real strategies must commit in day-ahead before seeing real-time.
 
+### X-T1 · Day-ahead plan, corrected in real-time (two stages, no look-ahead)
+- **Stage 1, 12:00 on D–1:** commit DA-B2's plan in the day-ahead market.
+- **Stage 2, 22:00 on D–1:** day D's day-ahead prices have been public since 15:00. Re-plan the
+  physical schedule on a real-time forecast: the mean of day D's day-ahead prices and the RT 7-day
+  average known at 22:00. Buy or sell the difference from the day-ahead position in real-time.
+- **Settles:** the day-ahead leg at DAM prices, the adjustment at RTM prices, with fees on both legs
+  and wear on physical discharge. Where real-time did not trade, the battery keeps to its
+  day-ahead plan in that block.
+- **Forecast choice (2 Nov 2026, 2-hour, 1 cycle, May 2022 – Oct 2026):** three forecasts were
+  tried. Day-ahead prices alone gave 31.7 lakh/MW/yr; adding the recent RT − DA gap gave 31.0;
+  the blend gave 33.9. DA-B2 alone gives 32.7. Only the blend is kept. Because it was picked from
+  three, its gain should be re-checked on new data before it is relied on.
+
+### X-XF · Best market per block, chosen ahead
+- At 12:00 on D–1, forecast day-ahead with DA-B2's profile and real-time with the mean of days
+  D–2 to D–8 (all complete by then). Buy each block in the market forecast cheaper and sell in the
+  one forecast dearer; settle each at that market's actual price.
+
 ## 3. What is reported for every baseline
 
 - Profit in ₹ lakh per MW per year: gross, and after wear cost.
