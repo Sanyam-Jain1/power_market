@@ -44,3 +44,12 @@ records followed by 4 summary records:
   daily "Avg" leaves them out. Genuine Rs 0 clearings (with volume) do occur and count.
 - With no-trade blocks excluded, every day's mean MCP and total MCV match IEX's own
   daily summary rows (checked by `validate` for all days).
+
+## Later days from the Dhruva terminal (`ingest-csv`)
+`python bess.py ingest-csv ../power_price_terminal/data` adds days after the last
+day loaded from `raw/` snapshot pages, from the terminal's month CSVs
+(`data/{dam,rtm}/YYYY-MM.csv`: date, block, purchase_bid_mw, sell_bid_mw, mcv_mw,
+scheduled_mw, mcp, congestion). Those come from IEX's JSON API and matched the
+snapshot pages block for block on Apr 2024, Jun 2025 and Sep 2026. Only complete
+days (96 blocks) are taken; an empty price is stored as NULL (nothing cleared).
+Files are recorded with source `csv:dhruva/<market>`.

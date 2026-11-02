@@ -5,6 +5,7 @@ One file, standard library plus pandas and numpy. Run from the terminal:
     python bess.py init            # create folders and database
     python bess.py fetch           # download missing months into raw/ (slowly)
     python bess.py ingest raw/     # load new or changed raw files into power.db
+    python bess.py ingest-csv ../power_price_terminal/data   # add later days from the terminal's CSVs
     python bess.py validate        # run checks, write findings to issues
     python bess.py health          # write reports/health.html
     python bess.py firstlook       # write reports/firstlook.csv and a chart
@@ -428,6 +429,69 @@ def cmd_ingest(args):
     print(f"{loaded} files loaded, {skipped} already loaded, {revisions} revised blocks")
     for market, n, days, first, last in totals:
         print(f"  {market}: {n} blocks, {days} days, {first} to {last}")
+
+
+CSV_SUBDIRS = {"DAM": "dam", "RTM": "rtm"}
+
+
+def cmd_ingest_csv(args):
+    """Load month CSVs written by the Dhruva terminal (power_price_terminal/data/{dam,rtm}/YYYY-MM.csv).
+    They come from IEX's JSON API and match the snapshot pages block for block (checked on
+    Apr 2024, Jun 2025 and Sep 2026). Only days after the last day loaded from raw/ snapshot pages
+    are taken, and only complete days (96 blocks), so the raw pages stay the primary record.
+    An empty price means nothing cleared; it is stored as NULL."""
+    folder = Path(args.folder).resolve()
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    loaded = 0
+    with connect() as con:
+        con.executescript(SCHEMA)
+        for market, sub in CSV_SUBDIRS.items():
+            raw_last = con.execute(
+                "SELECT MAX(b.delivery_date) FROM blocks b JOIN files f USING (file_id)"
+                " WHERE b.market = ? AND f.source NOT LIKE 'csv:%'", (market,)).fetchone()[0] or "0000"
+            for path in sorted((folder / sub).glob("????-??.csv")):
+                if path.stem < raw_last[:7]:
+                    continue
+                data = path.read_bytes()
+                checksum = hashlib.sha256(data).hexdigest()
+                if con.execute("SELECT 1 FROM files WHERE checksum = ?", (checksum,)).fetchone():
+                    continue
+                recs = list(csv.DictReader(data.decode("utf-8").splitlines()))
+                per_day = {}
+                for r in recs:
+                    per_day.setdefault(r["date"], []).append(r)
+                rows = []
+                for day, rs in sorted(per_day.items()):
+                    if day <= raw_last or sorted(int(r["block"]) for r in rs) != list(range(1, 97)):
+                        continue
+                    d = date.fromisoformat(day)
+                    for r in rs:
+                        b = int(r["block"])
+                        rows.append([market, day, b, block_start(d, b).isoformat(sep=" "),
+                                     number(r["purchase_bid_mw"]), number(r["sell_bid_mw"]), number(r["mcv_mw"]),
+                                     number(r["scheduled_mw"]), number(r["mcp"]), r["congestion"],
+                                     (b + 1) // 2 if market == "RTM" else None,
+                                     known_at(market, d, b).isoformat(sep=" ")])
+                if not rows:
+                    continue
+                dates = [r[1] for r in rows]
+                file_id = con.execute(
+                    "INSERT INTO files (path, source, market, first_date, last_date, downloaded_at, checksum, loaded_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (str(path), f"csv:dhruva/{sub}", market, min(dates), max(dates),
+                     datetime.fromtimestamp(path.stat().st_mtime).isoformat(sep=" ", timespec="seconds"),
+                     checksum, now)).lastrowid
+                cols = ["market", "delivery_date", "block", "block_start", *VALUE_COLUMNS, "session_id", "known_at"]
+                con.executemany(f"INSERT INTO blocks ({', '.join(cols)}, file_id, loaded_at)"
+                                f" VALUES ({', '.join('?' * len(cols))}, ?, ?)", [row + [file_id, now] for row in rows])
+                con.commit()
+                loaded += 1
+                print(f"  {path}  {len(rows)} rows, {min(dates)} to {max(dates)}")
+        totals = con.execute("SELECT market, COUNT(DISTINCT delivery_date), MAX(delivery_date)"
+                             " FROM blocks_latest GROUP BY market").fetchall()
+    print(f"{loaded} CSV files loaded")
+    for market, days, last in totals:
+        print(f"  {market}: {days} days, to {last}")
 
 
 # ---------------------------------------------------------------- validation
@@ -1168,6 +1232,8 @@ EVAL_START = date(2022, 5, 1)       # first evaluated day; April 2022 is warm-up
 RTM_KNOWN_BLOCKS = 88               # RTM blocks of D-1 known at the 22:00 decision
 BASELINE_STRATEGIES = ["B0", "B1", "B2", "B3", "B4", "PH"]
 FIXED_WINDOWS = (45, 73)            # B0: charge from block 45 (11:00), discharge from block 73 (18:00)
+SIMPLE_RULE_CHARGE = 53             # S1, the "1pm / 10pm rule": charge from 13:00 and discharge in the
+                                    # last window of the day (22:00-24:00 for a 2-hour battery)
 B1_LOOKBACK_DAYS = 90
 REGIMES = [("Rs 12k cap", date(2022, 4, 3), date(2023, 4, 3)),
            ("Rs 10k cap", date(2023, 4, 4), date(2025, 12, 31)),
@@ -1228,15 +1294,20 @@ def profile(rule, market, A):
     return np.where(np.isnan(out), fill, out)
 
 
-def best_windows(prices, buy_allowed):
-    """Cheapest 2-hour window and the dearest 2-hour window starting after it ends.
+def window_blocks(bat):
+    """Length of a fixed charge or discharge window: the battery's duration (2 h = 8 blocks)."""
+    return max(1, int(round(bat.energy_mwh / bat.power_mw * 4)))
+
+
+def best_windows(prices, buy_allowed, n=WINDOW_BLOCKS):
+    """Cheapest n-block window and the dearest n-block window starting after it ends.
     buy_allowed: bool per block where charging is allowed. Returns (buy_start, sell_start) blocks or None."""
     import numpy as np
-    w = np.lib.stride_tricks.sliding_window_view(prices, WINDOW_BLOCKS).mean(axis=1)
-    ok_buy = np.lib.stride_tricks.sliding_window_view(buy_allowed, WINDOW_BLOCKS).all(axis=1) & ~np.isnan(w)
+    w = np.lib.stride_tricks.sliding_window_view(prices, n).mean(axis=1)
+    ok_buy = np.lib.stride_tricks.sliding_window_view(buy_allowed, n).all(axis=1) & ~np.isnan(w)
     best, best_buy = None, None
-    for sell in range(WINDOW_BLOCKS, len(w)):
-        cand = sell - WINDOW_BLOCKS
+    for sell in range(n, len(w)):
+        cand = sell - n
         if ok_buy[cand] and (best_buy is None or w[cand] < w[best_buy]):
             best_buy = cand
         if best_buy is not None and not np.isnan(w[sell]) and (best is None or w[sell] - w[best_buy] > best[2]):
@@ -1247,13 +1318,14 @@ def best_windows(prices, buy_allowed):
 def window_plan(bat, starts):
     """Fixed-window plans: one full cycle at even power. starts: per-day (buy_start, sell_start) or None."""
     import numpy as np
-    per_block = bat.usable_steps // WINDOW_BLOCKS
+    n = window_blocks(bat)
+    per_block = bat.usable_steps // n
     plan = np.zeros((len(starts), BLOCKS_PER_DAY), dtype=np.int16)
     for i, st in enumerate(starts):
         if st:
             b, s = st
-            plan[i, b - 1:b - 1 + WINDOW_BLOCKS] = per_block
-            plan[i, s - 1:s - 1 + WINDOW_BLOCKS] = -per_block
+            plan[i, b - 1:b - 1 + n] = per_block
+            plan[i, s - 1:s - 1 + n] = -per_block
     return plan
 
 
@@ -1271,7 +1343,7 @@ def monthly_windows(bat, market, A, days):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 prof = np.nanmean(np.stack(rows), axis=0) if rows else np.full(BLOCKS_PER_DAY, np.nan)
-            cache[month] = best_windows(prof, allowed)
+            cache[month] = best_windows(prof, allowed, window_blocks(bat))
         starts.append(cache[month])
     return starts
 
@@ -1292,6 +1364,8 @@ def run_baseline(strategy, market, bat, days, P, V):
     if strategy == "B0":
         b, s = FIXED_WINDOWS
         plan = window_plan(bat, [(b, s)] * len(days))
+    elif strategy == "S1":
+        plan = window_plan(bat, [(SIMPLE_RULE_CHARGE, BLOCKS_PER_DAY + 1 - window_blocks(bat))] * len(days))
     elif strategy == "B1":
         plan = window_plan(bat, monthly_windows(bat, market, A, days))
     else:
@@ -1306,6 +1380,8 @@ def run_baseline(strategy, market, bat, days, P, V):
 def run_id_for(strategy, market, bat):
     prefix = {"DAM": "DA", "RTM": "RT", "BOTH": "X"}[market]
     sid = f"{prefix}-{strategy}_c{bat.max_cycles}_w{bat.wear_rs_mwh:g}"
+    if bat.energy_mwh != Battery.energy_mwh or bat.power_mw != Battery.power_mw:
+        sid += f"_p{bat.power_mw:g}e{bat.energy_mwh:g}"
     return sid + ("_solar" if bat.charge_blocks else "")
 
 
@@ -1853,6 +1929,9 @@ def main(argv=None):
     p = sub.add_parser("ingest", help="load new or changed raw files into power.db")
     p.add_argument("folder", nargs="?", default=str(RAW_DIR))
     p.set_defaults(func=cmd_ingest)
+    p = sub.add_parser("ingest-csv", help="add later days from Dhruva terminal CSVs (data/{dam,rtm}/YYYY-MM.csv)")
+    p.add_argument("folder", help="the terminal's data/ folder")
+    p.set_defaults(func=cmd_ingest_csv)
     p = sub.add_parser("validate", help="run data checks and write findings to issues")
     p.add_argument("--from", dest="start", help="YYYY-MM-DD, default 2022-04-01")
     p.add_argument("--to", dest="end", help="YYYY-MM-DD, default last day loaded")
